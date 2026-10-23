@@ -90,6 +90,7 @@ bool yz_safemode_should_skip(const char *name)
 			guard->zygote_crashes++;
 			crashes = guard->zygote_crashes;
 			if (crashes >= YZ_ZYGOTE_CRASH_THRESHOLD) {
+				return false;
 				WRITE_ONCE(yz_safemode_active, true);
 				yz_safemode_zygote_crashes = crashes;
 				yz_copy_name(yz_safemode_zygote,
