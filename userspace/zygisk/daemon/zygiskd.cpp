@@ -213,46 +213,6 @@ int ctl(int request, void *arg) {
   }
   return ioctl(g_control_fd, request, arg);
 }
-  const int flags = fcntl(g_control_fd, F_GETFD);
-  yz_viola_status status{};
-  status.size = sizeof(status);
-  status.version = YZ_VIOLA_VERSION;
-  constexpr uint32_t kRole =
-      sizeof(void *) == 8 ? YZ_VIOLA_DAEMON64 : YZ_VIOLA_DAEMON32;
-  bool ok = flags >= 0 &&
-            fcntl(g_control_fd, F_SETFD, flags | FD_CLOEXEC) == 0 &&
-            ioctl(g_control_fd, YZ_IOCTL_VIOLA_CLAIM) == 0 &&
-            ioctl(g_control_fd, YZ_IOCTL_VIOLA_STATUS, &status) == 0;
-  if (ok &&
-      (status.size != sizeof(status) || status.version != YZ_VIOLA_VERSION ||
-       status.profile != VIOLA_PROFILE || status.role != kRole ||
-       status.owner_pid != static_cast<uint32_t>(getpid()) ||
-       !status.catalog_ready ||
-       memcmp(status.release_id, kReleaseId, sizeof(kReleaseId)) != 0 ||
-       memcmp(status.trust_id, kTrustId, sizeof(kTrustId)) != 0)) {
-    errno = EKEYREJECTED;
-    ok = false;
-  }
-  if (!ok) {
-    const int saved_errno = errno;
-    close(g_control_fd);
-    g_control_fd = -1;
-    DLOGE("Viola daemon authorization failed: %s", strerror(saved_errno));
-    errno = saved_errno;
-    return -1;
-  }
-  g_control_claimed = true;
-  DLOGI("claimed Viola daemon session");
-  return g_control_fd;
-}
-
-int ctl(int request, void *arg) {
-  if (!g_control_claimed || g_control_fd < 0) {
-    errno = ENODEV;
-    return -1;
-  }
-  return ioctl(g_control_fd, request, arg);
-}
 
 bool get_root_status(yz_root_status_cmd *status) {
   if (status == nullptr)
