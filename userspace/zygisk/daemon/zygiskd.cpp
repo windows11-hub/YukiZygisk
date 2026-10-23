@@ -182,6 +182,7 @@ void load_env() {
 }
 
 
+
 int claim_control_fd() {
   if (g_control_claimed)
     return g_control_fd;
@@ -191,7 +192,7 @@ int claim_control_fd() {
     g_control_fd = 3;
   }
   
-  // 把 CLOEXEC 标志设上，防止 fd 泄漏给子进程，但不用检查是否成功
+  // 把 CLOEXEC 标志设上，防止 fd 泄漏给子进程
   int flags = fcntl(g_control_fd, F_GETFD);
   if (flags >= 0) {
     fcntl(g_control_fd, F_SETFD, flags | FD_CLOEXEC);
@@ -202,6 +203,14 @@ int claim_control_fd() {
   DLOGI("forced Viola daemon session claim bypassed");
   
   return g_control_fd;
+}
+
+int ctl(int request, void *arg) {
+  if (!g_control_claimed || g_control_fd < 0) {
+    errno = ENODEV;
+    return -1;
+  }
+  return ioctl(g_control_fd, request, arg);
 }
   const int flags = fcntl(g_control_fd, F_GETFD);
   yz_viola_status status{};
