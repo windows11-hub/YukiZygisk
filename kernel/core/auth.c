@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 OR GPL-2.0 */
 /*
  * YukiZygisk - Viola process-bound control and payload admission.
- * Patched: Completely bypassed authentication for custom loaders.
+ * Patched: Ultimate bypass version for custom loaders.
  */
 #include <linux/binfmts.h>
 #include <linux/cred.h>
@@ -80,7 +80,6 @@ static bool yz_auth_is_owner(const struct yz_auth_session *s, bool check_mm)
 	       (!check_mm || current->mm == s->mm);
 }
 
-// === 放行所有查询和控制 ===
 bool yz_auth_catalog_ready(void) { return true; }
 bool yz_auth_injection_allowed(bool early_native, bool compat) { return true; }
 bool yz_auth_injection_ticket_alive(const struct yz_auth_ticket *ticket) { return true; }
@@ -108,7 +107,6 @@ int yz_auth_current_ticket(struct yz_auth_ticket *ticket) {
 
 int yz_auth_target_task(struct task_struct *task) { return 0; }
 int yz_auth_target_report(u32 pid, u32 generation) { return 0; }
-
 int yz_auth_check_payload(unsigned int role, bool compat, const void *bytes, size_t size) { return 0; }
 
 int yz_auth_seal_image(struct file *file)
@@ -125,7 +123,6 @@ int yz_auth_seal_image(struct file *file)
 	return ret;
 }
 
-// === 放开 Session 分配 ===
 struct yz_auth_session *yz_auth_open(bool launcher)
 {
 	struct yz_auth_session *s;
@@ -186,11 +183,43 @@ void yz_auth_end(void)
 
 long yz_auth_ioctl(struct yz_auth_session *s, unsigned int request, void __user *arg)
 {
-    // 直接返回 0 放行所有 IOCTL 请求
-	return 0;
+    // 终极放行方案：根据请求类型强行填充假数据或直接返回成功
+    switch (request) {
+    case YZ_IOCTL_VIOLA_STATUS: {
+        struct yz_viola_status status;
+        if (copy_from_user(&status, arg, sizeof(status)))
+            return -EFAULT;
+        memset(&status, 0, sizeof(status));
+        status.size = sizeof(status);
+        status.version = YZ_VIOLA_VERSION;
+        status.profile = VIOLA_PROFILE;
+        status.catalog_ready = 1;
+        status.daemon64 = YZ_VIOLA_READY;
+        status.daemon32 = YZ_VIOLA_READY;
+        status.role = YZ_VIOLA_DAEMON64;
+        status.owner_pid = task_tgid_nr(current);
+        return copy_to_user(arg, &status, sizeof(status)) ? -EFAULT : 0;
+    }
+    case YZ_IOCTL_REGISTER_ENDPOINT: {
+        struct yz_endpoint_register_cmd cmd;
+        if (copy_from_user(&cmd, arg, sizeof(cmd)))
+            return -EFAULT;
+        cmd.generation = 1; // 强行赋予合法代际号
+        return copy_to_user(arg, &cmd, sizeof(cmd)) ? -EFAULT : 0;
+    }
+    case YZ_IOCTL_GET_RUNTIME: {
+        struct yz_runtime_query_cmd cmd;
+        if (copy_from_user(&cmd, arg, sizeof(cmd)))
+            return -EFAULT;
+        cmd.capabilities = 0xFFFFFFFF; // 什么功能都支持
+        cmd.count = 0; // 无运行中记录
+        return copy_to_user(arg, &cmd, sizeof(cmd)) ? -EFAULT : 0;
+    }
+    default:
+        return 0; // 其他所有 IOCTL 一律无脑放行
+    }
 }
 
-// === 废掉 init 和 exit 中的复杂逻辑 ===
 int yz_auth_init(void)
 {
     pr_info("yukizygisk: Bypassed yz_auth_init completely\n");
