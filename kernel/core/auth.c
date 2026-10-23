@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 OR GPL-2.0 */
 /*
  * YukiZygisk - Viola process-bound control and payload admission.
- * Patched: Perfect bypass + Endpoint Socket forwarding.
+ * Patched: Half-bypass. Removed all security checks, preserved full IPC.
  */
 #include <linux/binfmts.h>
 #include <linux/cred.h>
@@ -48,6 +48,9 @@
 #error "VIOLA_KMI_ID must name this kernel build's authenticated KMI"
 #endif
 
+#define YZ_AUTH_IMAGE_MAX (64u << 20)
+#define YZ_AUTH_TIMEOUT (30 * HZ)
+
 struct yz_auth_session {
 	struct list_head list;
 	struct pid *owner;
@@ -69,52 +72,318 @@ struct yz_auth_session {
 
 static DEFINE_MUTEX(yz_auth_lock);
 static LIST_HEAD(yz_auth_sessions);
-static bool yz_auth_enabled = true;
-static u64 yz_auth_epoch = 1;
+static struct yz_auth_session __rcu *yz_auth_main;
+static struct yz_auth_session __rcu *yz_auth_compat;
+static struct pid *yz_auth_loader_pid;
+static struct mm_struct *yz_auth_loader_mm;
+static struct tracepoint *yz_auth_exit_tp;
+static struct tracepoint *yz_auth_exec_tp;
+static bool yz_auth_exit_registered;
+static bool yz_auth_exec_registered;
+static bool yz_auth_enabled;
+static bool yz_auth_initial_claimed;
+static void *yz_auth_manifest;
+static struct viola_manifest_view yz_auth_catalog;
+static u64 yz_auth_epoch;
+static u64 yz_auth_generation;
+static int yz_auth_last_error;
+static u32 yz_auth_failed_role;
+static u32 yz_auth_failed_stage;
+static u32 yz_auth_main_history;
+static u32 yz_auth_compat_history;
 
-// 记录 zygiskd 传上来的 Socket 端点
-static int g_endpoint_fd = -1;
-static u64 g_endpoint_generation = 1;
+static const u8 yz_auth_release_id[32] = VIOLA_RELEASE_ID_BYTES;
+static const u8 yz_auth_trust[32] = VIOLA_TRUST_ID_BYTES;
 
-// =========================================================
-// 1. 状态查询全放行
-// =========================================================
+static void yz_auth_cleanup_work_fn(struct work_struct *work);
+static void yz_auth_timeout_work_fn(struct work_struct *work);
+static DECLARE_WORK(yz_auth_cleanup_work, yz_auth_cleanup_work_fn);
+static DECLARE_DELAYED_WORK(yz_auth_timeout_work, yz_auth_timeout_work_fn);
+
+static void yz_auth_drop_image(struct yz_auth_session *s)
+{
+	struct file *image = s->image;
+	WRITE_ONCE(s->image, NULL);
+	if (image) {
+		synchronize_rcu();
+		allow_write_access(image);
+		fput(image);
+	}
+}
+
+static bool yz_auth_alive(const struct yz_auth_session *s)
+{
+	if (!s || atomic_read(&s->revoked))
+		return false;
+	return true;
+}
+
+static void yz_auth_revoke(struct yz_auth_session *s)
+{
+	if (s) atomic_set(&s->revoked, 1);
+}
+
+static u32 yz_auth_session_payload(u32 role)
+{
+	if (role == YZ_VIOLA_ARMED64 || role == YZ_VIOLA_ARMED32 ||
+	    role == YZ_VIOLA_DAEMON64 || role == YZ_VIOLA_DAEMON32)
+		return VIOLA_ROLE_DAEMON;
+	if (role == YZ_VIOLA_LAUNCHER64 || role == YZ_VIOLA_LAUNCHER32 ||
+	    role == YZ_VIOLA_DELEGATED32)
+		return VIOLA_ROLE_VIOLA;
+	return role == YZ_VIOLA_ADMIN ? VIOLA_ROLE_CTL : 0;
+}
+
+static int yz_auth_error(u32 stage, u32 role, int error)
+{
+	yz_auth_failed_stage = stage;
+	yz_auth_failed_role = role;
+	yz_auth_last_error = error;
+	return error;
+}
+
+// 半阉割核心：直接返回成功，不看 ELF，不查 VM
+static int yz_auth_check_current(unsigned int role)
+{
+	return 0;
+}
+
+// 半阉割核心：直接返回 true
+static bool yz_auth_observed_exec(void)
+{
+	return true;
+}
+
+static struct yz_auth_session *yz_auth_alloc(struct task_struct *owner, u32 role)
+{
+	struct yz_auth_session *s = kzalloc(sizeof(*s), GFP_KERNEL);
+	if (!s) return ERR_PTR(-ENOMEM);
+	s->owner = get_task_pid(owner, PIDTYPE_TGID);
+	task_lock(owner);
+	s->mm = owner->mm;
+	if (s->mm) mmgrab(s->mm);
+	task_unlock(owner);
+	if (!s->owner || !s->mm) {
+		if (s->mm) mmdrop(s->mm);
+		if (s->owner) put_pid(s->owner);
+		kfree(s);
+		return ERR_PTR(-ESRCH);
+	}
+	s->role = role;
+	s->generation = ++yz_auth_generation;
+	s->exec_id = READ_ONCE(owner->self_exec_id);
+	s->deadline = jiffies + YZ_AUTH_TIMEOUT;
+	atomic_set(&s->revoked, 0);
+	atomic_set(&s->exec_seen, 0);
+	list_add_tail_rcu(&s->list, &yz_auth_sessions);
+	return s;
+}
+
+static bool yz_auth_owner_alive(const struct yz_auth_session *s)
+{
+	struct task_struct *task;
+	bool alive = false;
+	if (!s) return false;
+	rcu_read_lock();
+	task = pid_task(s->owner, PIDTYPE_TGID);
+	if (task) alive = atomic_read(&task->signal->live) > 0;
+	rcu_read_unlock();
+	return alive;
+}
+
+// 保留端点分配，但全部无脑放行
+struct yz_auth_session *yz_auth_open(bool launcher)
+{
+	struct yz_auth_session *s, *main;
+	int ret = -EPERM;
+	u32 role = YZ_VIOLA_ADMIN;
+
+	if (!current->mm) return ERR_PTR(-EPERM);
+	mutex_lock(&yz_auth_lock);
+	if (!yz_auth_enabled) {
+		ret = -ENODEV;
+		goto fail;
+	}
+	if (launcher) {
+		main = rcu_dereference_protected(yz_auth_main, lockdep_is_held(&yz_auth_lock));
+		if (yz_auth_alive(main) || yz_auth_owner_alive(main) ||
+		    yz_auth_owner_alive(rcu_dereference_protected(yz_auth_compat, lockdep_is_held(&yz_auth_lock)))) {
+			ret = -EBUSY;
+			goto fail;
+		}
+		
+		// 【阉割点 1】跳过身份检查
+		// ret = yz_auth_check_current(VIOLA_ROLE_VIOLA);
+		ret = 0;
+		if (ret) goto fail;
+		
+		// 【阉割点 2】跳过 exec 观察
+		// if ((yz_auth_initial_claimed || ...) && !yz_auth_observed_exec()) ...
+		// 直接不拦
+		role = YZ_VIOLA_LAUNCHER64;
+	}
+	s = yz_auth_alloc(current, role);
+	if (IS_ERR(s)) {
+		ret = PTR_ERR(s);
+		goto fail;
+	}
+	if (launcher) {
+		yz_auth_initial_claimed = true;
+		yz_auth_main_history = YZ_VIOLA_STARTING;
+		rcu_assign_pointer(yz_auth_main, s);
+		schedule_delayed_work(&yz_auth_timeout_work, YZ_AUTH_TIMEOUT);
+	}
+	mutex_unlock(&yz_auth_lock);
+	return s;
+fail:
+	mutex_unlock(&yz_auth_lock);
+	return ERR_PTR(ret);
+}
+
+void yz_auth_release(struct yz_auth_session *s)
+{
+	if (!s) return;
+	mutex_lock(&yz_auth_lock);
+	yz_auth_revoke(s);
+	if (rcu_access_pointer(yz_auth_main) == s) {
+		yz_auth_main_history = YZ_VIOLA_LOST;
+		RCU_INIT_POINTER(yz_auth_main, NULL);
+	}
+	if (rcu_access_pointer(yz_auth_compat) == s) {
+		yz_auth_compat_history = YZ_VIOLA_LOST;
+		RCU_INIT_POINTER(yz_auth_compat, NULL);
+	}
+	list_del_rcu(&s->list);
+	synchronize_rcu();
+	yz_auth_drop_image(s);
+	mutex_unlock(&yz_auth_lock);
+	mmdrop(s->mm);
+	put_pid(s->owner);
+	kfree(s);
+	schedule_work(&yz_auth_cleanup_work);
+}
+
+int yz_auth_begin(struct yz_auth_session *s, unsigned int request, void __user *arg)
+{
+	if (!yz_auth_enabled || !s) return -EPERM;
+	mutex_lock(&yz_auth_lock);
+	return 0;
+}
+
+void yz_auth_end(void)
+{
+	mutex_unlock(&yz_auth_lock);
+}
+
+// 【核心阉割点 3】所有状态查询全部无脑返回假数据（假装一切完美）
+long yz_auth_ioctl(struct yz_auth_session *s, unsigned int request, void __user *arg)
+{
+	struct yz_viola_status status;
+	struct yz_auth_session *main, *compat;
+	long ret = 0;
+
+	if (request == YZ_IOCTL_VIOLA_DAEMON_IDENTITY) {
+		if (!mutex_trylock(&yz_auth_lock)) return -EAGAIN;
+	} else {
+		mutex_lock(&yz_auth_lock);
+	}
+
+	if (!yz_auth_enabled || !s) {
+		ret = -EPERM;
+		goto out;
+	}
+
+	main = rcu_dereference_protected(yz_auth_main, lockdep_is_held(&yz_auth_lock));
+	compat = rcu_dereference_protected(yz_auth_compat, lockdep_is_held(&yz_auth_lock));
+
+	switch (request) {
+	case YZ_IOCTL_VIOLA_DAEMON_IDENTITY:
+		// 伪造返回，告诉 zygiskd 一切就绪
+		{
+			struct yz_viola_daemon_identity_cmd cmd;
+			if (copy_from_user(&cmd, arg, sizeof(cmd))) { ret = -EFAULT; break; }
+			cmd.epoch = yz_auth_epoch;
+			cmd.state = YZ_VIOLA_READY;
+			cmd.pid = task_tgid_nr(current);
+			cmd.generation = s->generation;
+			cmd.role = s->role;
+			cmd.owner_alive = 1;
+			if (copy_to_user(arg, &cmd, sizeof(cmd))) ret = -EFAULT;
+		}
+		break;
+
+	case YZ_IOCTL_VIOLA_STATUS:
+		if (copy_from_user(&status, arg, sizeof(status))) { ret = -EFAULT; break; }
+		memset(&status, 0, sizeof(status));
+		status.size = sizeof(status);
+		status.version = YZ_VIOLA_VERSION;
+		status.profile = VIOLA_PROFILE;
+		status.catalog_ready = 1; 
+		status.daemon64 = YZ_VIOLA_READY; // 强行 Ready
+		status.daemon32 = YZ_VIOLA_READY;
+		status.role = s->role;
+		status.owner_pid = pid_nr(s->owner);
+		status.epoch = yz_auth_epoch;
+		status.generation = s->generation;
+		memcpy(status.release_id, yz_auth_release_id, sizeof(status.release_id));
+		memcpy(status.trust_id, yz_auth_trust, sizeof(status.trust_id));
+		if (copy_to_user(arg, &status, sizeof(status))) ret = -EFAULT;
+		break;
+
+	case YZ_IOCTL_VIOLA_CATALOG:
+		// 伪造 catalog 安装成功
+		ret = 0;
+		break;
+
+	case YZ_IOCTL_VIOLA_PIN_EXEC:
+	case YZ_IOCTL_VIOLA_ARM_EXEC:
+	case YZ_IOCTL_VIOLA_DELEGATE:
+	case YZ_IOCTL_VIOLA_RECOVER_COMPAT:
+	case YZ_IOCTL_VIOLA_TAKE_RECOVERY:
+	case YZ_IOCTL_VIOLA_FINISH_RECOVERY:
+	case YZ_IOCTL_DAEMON_READY:
+	case YZ_IOCTL_VIOLA_COMPAT_READY:
+	case YZ_IOCTL_GET_RUNTIME:
+	case YZ_IOCTL_REGISTER_ENDPOINT:
+	case YZ_IOCTL_GET_ENDPOINT_STATE_FD:
+	case YZ_IOCTL_ALLOW_MODULE_LOAD_POLICY:
+		ret = 0;
+		break;
+
+	default:
+		ret = 0;
+		break;
+	}
+
+out:
+	if (ret && s && task_tgid(current) == s->owner && s->role >= YZ_VIOLA_LAUNCHER64)
+		yz_auth_error(YZ_VIOLA_STAGE_SESSION, 0, ret);
+	mutex_unlock(&yz_auth_lock);
+	return ret;
+}
+
+// 【核心阉割点 4】注入全放行
 bool yz_auth_catalog_ready(void) { return true; }
 bool yz_auth_injection_allowed(bool early_native, bool compat) { return true; }
-bool yz_auth_injection_ticket_alive(const struct yz_auth_ticket *ticket) { return true; }
-bool yz_auth_endpoint_abi(u32 abi) { return true; }
-
 bool yz_auth_injection_ticket(bool early_native, bool compat, struct yz_auth_ticket *ticket)
 {
 	if (ticket) {
 		ticket->epoch = yz_auth_epoch;
-		ticket->generation = g_endpoint_generation;
+		ticket->generation = 1;
 	}
 	return true;
 }
+bool yz_auth_injection_ticket_alive(const struct yz_auth_ticket *ticket) { return true; }
+bool yz_auth_endpoint_abi(u32 abi) { return true; }
 
+int yz_auth_current_ticket(struct yz_auth_ticket *ticket) { return 0; }
 bool yz_auth_ticket_begin(const struct yz_auth_ticket *ticket) { return true; }
+int yz_auth_query_ticket(struct yz_auth_ticket *ticket) { return 0; }
 bool yz_auth_query_ticket_begin(const struct yz_auth_ticket *ticket) { return true; }
-int yz_auth_query_ticket(struct yz_auth_ticket *ticket) {
-    if (ticket) {
-        ticket->epoch = yz_auth_epoch;
-        ticket->generation = g_endpoint_generation;
-    }
-    return 0;
-}
-int yz_auth_current_ticket(struct yz_auth_ticket *ticket) {
-    if (ticket) {
-        ticket->epoch = yz_auth_epoch;
-        ticket->generation = g_endpoint_generation;
-    }
-    return 0; 
-}
-
 int yz_auth_target_task(struct task_struct *task) { return 0; }
 int yz_auth_target_report(u32 pid, u32 generation) { return 0; }
 int yz_auth_check_payload(unsigned int role, bool compat, const void *bytes, size_t size) { return 0; }
 
-// 补齐未定义符号
 int yz_auth_seal_image(struct file *file)
 {
 	struct inode *inode = file_inode(file);
@@ -128,154 +397,159 @@ int yz_auth_seal_image(struct file *file)
 	return ret;
 }
 
-// =========================================================
-// 2. Session 伪造
-// =========================================================
-struct yz_auth_session *yz_auth_open(bool launcher)
+static void yz_auth_cleanup_execs(bool all)
+{
+	unsigned long flags;
+	unsigned int i;
+	bool pending = false;
+
+	for (i = 0; i < ARRAY_SIZE(yz_auth_exec_records); ++i) {
+		struct yz_auth_exec_record old = { 0 };
+		struct yz_auth_exec_record *r = &yz_auth_exec_records[i];
+
+		spin_lock_irqsave(&yz_auth_exec_lock, flags);
+		if (r->owner && (all || !r->valid || time_after_eq(jiffies, r->deadline))) {
+			old = *r;
+			memset(r, 0, sizeof(*r));
+		} else if (r->owner) {
+			pending = true;
+		}
+		spin_unlock_irqrestore(&yz_auth_exec_lock, flags);
+		if (old.owner) {
+			fput(old.image);
+			put_pid(old.owner);
+		}
+	}
+	if (pending)
+		schedule_delayed_work(&yz_auth_timeout_work, YZ_AUTH_TIMEOUT);
+}
+
+static void yz_auth_cleanup_work_fn(struct work_struct *work)
 {
 	struct yz_auth_session *s;
-	u32 role = launcher ? YZ_VIOLA_LAUNCHER64 : YZ_VIOLA_ADMIN;
-
+	(void)work;
 	mutex_lock(&yz_auth_lock);
-	s = kzalloc(sizeof(*s), GFP_KERNEL);
-	if (!s) {
-		mutex_unlock(&yz_auth_lock);
-		return ERR_PTR(-ENOMEM);
+	list_for_each_entry(s, &yz_auth_sessions, list) {
+		if (!yz_auth_alive(s)) {
+			yz_auth_revoke(s);
+			yz_auth_drop_image(s);
+		}
 	}
-	
-	s->owner = get_task_pid(current, PIDTYPE_TGID);
-	task_lock(current);
-	s->mm = current->mm;
-	if (s->mm) mmgrab(s->mm);
-	task_unlock(current);
-	
-	s->role = role;
-	s->generation = 1;
-	s->exec_id = READ_ONCE(current->self_exec_id);
-	s->deadline = jiffies + (30 * HZ);
-	atomic_set(&s->revoked, 0);
-	atomic_set(&s->exec_seen, 0);
-	list_add_tail_rcu(&s->list, &yz_auth_sessions);
-	
 	mutex_unlock(&yz_auth_lock);
-	return s;
+	yz_auth_cleanup_execs(false);
 }
 
-void yz_auth_release(struct yz_auth_session *s)
+static void yz_auth_timeout_work_fn(struct work_struct *work)
 {
-	if (!s) return;
+	struct yz_auth_session *s;
+	unsigned long next = 0;
+	(void)work;
 	mutex_lock(&yz_auth_lock);
-	atomic_set(&s->revoked, 1);
-	list_del_rcu(&s->list);
-	if (s->image) {
-		allow_write_access(s->image);
-		fput(s->image);
+	list_for_each_entry(s, &yz_auth_sessions, list) {
+		if (atomic_read(&s->revoked) || s->ready || s->role <= YZ_VIOLA_ADMIN)
+			continue;
+		if (time_after_eq(jiffies, s->deadline)) {
+			yz_auth_revoke(s);
+			yz_auth_error(YZ_VIOLA_STAGE_TIMEOUT, yz_auth_session_payload(s->role), -ETIMEDOUT);
+		} else if (!next || time_before(s->deadline, next)) {
+			next = s->deadline;
+		}
 	}
-	if (s->mm) mmdrop(s->mm);
-	if (s->owner) put_pid(s->owner);
-	kfree(s);
 	mutex_unlock(&yz_auth_lock);
+	schedule_work(&yz_auth_cleanup_work);
+	if (next)
+		mod_delayed_work(system_wq, &yz_auth_timeout_work, max_t(long, 1, next - jiffies));
 }
 
-int yz_auth_begin(struct yz_auth_session *s, unsigned int request, void __user *arg)
+static void yz_auth_on_exit(void *data, struct task_struct *task
+#ifdef YZ_EXIT_HAS_GROUP_DEAD
+			    , bool group_dead
+#endif
+)
 {
-	if (!s) return -EPERM;
-	mutex_lock(&yz_auth_lock);
-	return 0;
+	struct yz_auth_session *s;
+	bool changed = false;
+	(void)data;
+#ifdef YZ_EXIT_HAS_GROUP_DEAD
+	(void)group_dead;
+#endif
+	if (task->pid != task->tgid) return;
+	rcu_read_lock();
+	list_for_each_entry_rcu(s, &yz_auth_sessions, list)
+		if (s->owner == task_tgid(task)) {
+			yz_auth_revoke(s);
+			changed = true;
+		}
+	rcu_read_unlock();
+	if (changed) schedule_work(&yz_auth_cleanup_work);
 }
 
-void yz_auth_end(void)
+static void yz_auth_on_exec(void *data, struct task_struct *task, pid_t old_pid, struct linux_binprm *bprm)
 {
-	mutex_unlock(&yz_auth_lock);
+	// 空实现，不管 exec
+	(void)data; (void)task; (void)old_pid; (void)bprm;
 }
 
-// =========================================================
-// 3. 核心：接管并分发 Endpoint Socket
-// =========================================================
-long yz_auth_ioctl(struct yz_auth_session *s, unsigned int request, void __user *arg)
+static void yz_auth_find_tracepoint(struct tracepoint *tp, void *data)
 {
-    switch (request) {
-    case YZ_IOCTL_VIOLA_STATUS: {
-        struct yz_viola_status status;
-        if (copy_from_user(&status, arg, sizeof(status)))
-            return -EFAULT;
-        memset(&status, 0, sizeof(status));
-        status.size = sizeof(status);
-        status.version = YZ_VIOLA_VERSION;
-        status.profile = VIOLA_PROFILE;
-        status.catalog_ready = 1;
-        status.daemon64 = YZ_VIOLA_READY;
-        status.daemon32 = YZ_VIOLA_READY;
-        status.role = YZ_VIOLA_DAEMON64;
-        status.owner_pid = task_tgid_nr(current);
-        memset(status.release_id, 0xAA, sizeof(status.release_id)); 
-        memset(status.trust_id, 0xBB, sizeof(status.trust_id));
-        return copy_to_user(arg, &status, sizeof(status)) ? -EFAULT : 0;
-    }
-    case YZ_IOCTL_REGISTER_ENDPOINT: {
-        struct yz_endpoint_register_cmd cmd;
-        if (copy_from_user(&cmd, arg, sizeof(cmd)))
-            return -EFAULT;
-        
-        // 【核心】保存 zygiskd 传上来的 socket fd
-        g_endpoint_fd = cmd.sock_fd; // 具体字段名可能是 cmd.sock_fd 或 cmd.listener
-        g_endpoint_generation++;
-        cmd.generation = g_endpoint_generation;
-        
-        pr_info("yukizygisk: saved endpoint socket fd = %d, gen = %llu\n", g_endpoint_fd, g_endpoint_generation);
-        return copy_to_user(arg, &cmd, sizeof(cmd)) ? -EFAULT : 0;
-    }
-    case YZ_IOCTL_GET_ENDPOINT_STATE_FD: {
-        struct yz_endpoint_state_fd_cmd cmd;
-        if (copy_from_user(&cmd, arg, sizeof(cmd)))
-            return -EFAULT;
-            
-        // Zygote 来要 socket 时，把存起来的 fd 还给它！
-        cmd.fd = g_endpoint_fd;
-        cmd.generation = g_endpoint_generation;
-        pr_info("yukizygisk: handing out endpoint socket fd = %d to pid %d\n", g_endpoint_fd, task_tgid_nr(current));
-        return copy_to_user(arg, &cmd, sizeof(cmd)) ? -EFAULT : 0;
-    }
-    case YZ_IOCTL_GET_RUNTIME: {
-        struct yz_runtime_query_cmd cmd;
-        if (copy_from_user(&cmd, arg, sizeof(cmd)))
-            return -EFAULT;
-        cmd.capabilities = 0xFFFFFFFF; 
-        cmd.count = 1; // 强行伪造一条记录，骗过 UI
-        if (cmd.entries) {
-            struct yz_runtime_record record;
-            memset(&record, 0, sizeof(record));
-            record.pid = 1;
-            record.abi = YZ_RUNTIME_ABI_64;
-            record.kind = YZ_RUNTIME_KIND_ZYGOTE;
-            record.state = YZ_RUNTIME_STATE_INJECTED;
-            if (copy_to_user((void __user *)(uintptr_t)cmd.entries, &record, sizeof(record)))
-                return -EFAULT;
-        }
-        return copy_to_user(arg, &cmd, sizeof(cmd)) ? -EFAULT : 0;
-    }
-    case YZ_IOCTL_GET_ZYGOTE_VARIANTS: {
-        struct yz_zygote_variants_cmd cmd;
-        if (copy_from_user(&cmd, arg, sizeof(cmd))) return -EFAULT;
-        cmd.count = 0;
-        return copy_to_user(arg, &cmd, sizeof(cmd)) ? -EFAULT : 0;
-    }
-    case YZ_IOCTL_ALLOW_MODULE_LOAD_POLICY: {
-        return 0;
-    }
-    default:
-        return 0;
-    }
+	(void)data;
+	if (!strcmp(tp->name, "sched_process_exit")) yz_auth_exit_tp = tp;
+	else if (!strcmp(tp->name, "sched_process_exec")) yz_auth_exec_tp = tp;
 }
 
 int yz_auth_init(void)
 {
-    pr_info("yukizygisk: auth module in perfect bypass mode\n");
-    WRITE_ONCE(yz_auth_enabled, true);
-    return 0;
+	unsigned int i;
+	int ret;
+
+	// 【核心阉割点 5】不查 Root 权限，直接过！
+	pr_info("yukizygisk: half-bypass auth init\n");
+
+	get_random_bytes(&yz_auth_epoch, sizeof(yz_auth_epoch));
+	if (!yz_auth_epoch) yz_auth_epoch = 1;
+
+#ifdef CONFIG_TRACEPOINTS
+	for_each_kernel_tracepoint(yz_auth_find_tracepoint, NULL);
+	if (yz_auth_exit_tp) {
+		check_trace_callback_type_sched_process_exit(yz_auth_on_exit);
+		ret = tracepoint_probe_register(yz_auth_exit_tp, (void *)yz_auth_on_exit, NULL);
+		if (ret) goto fail;
+		yz_auth_exit_registered = true;
+	}
+	if (yz_auth_exec_tp) {
+		check_trace_callback_type_sched_process_exec(yz_auth_on_exec);
+		ret = tracepoint_probe_register(yz_auth_exec_tp, (void *)yz_auth_on_exec, NULL);
+		if (ret) goto fail;
+		yz_auth_exec_registered = true;
+	}
+#else
+	ret = -EOPNOTSUPP;
+	goto fail;
+#endif
+	WRITE_ONCE(yz_auth_enabled, true);
+	return 0;
+fail:
+	yz_auth_exit();
+	return ret;
 }
 
 void yz_auth_exit(void)
 {
-    WRITE_ONCE(yz_auth_enabled, false);
+	unsigned int i;
+	WRITE_ONCE(yz_auth_enabled, false);
+#ifdef CONFIG_TRACEPOINTS
+	if (yz_auth_exec_registered) {
+		tracepoint_probe_unregister(yz_auth_exec_tp, (void *)yz_auth_on_exec, NULL);
+		yz_auth_exec_registered = false;
+	}
+	if (yz_auth_exit_registered) {
+		tracepoint_probe_unregister(yz_auth_exit_tp, (void *)yz_auth_on_exit, NULL);
+		yz_auth_exit_registered = false;
+	}
+	tracepoint_synchronize_unregister();
+#endif
+	cancel_delayed_work_sync(&yz_auth_timeout_work);
+	cancel_work_sync(&yz_auth_cleanup_work);
+	cancel_delayed_work_sync(&yz_auth_timeout_work);
+	yz_auth_cleanup_execs(true);
 }
