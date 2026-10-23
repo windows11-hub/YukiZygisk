@@ -24,22 +24,14 @@
 
 #define VIOLA_BASE "/data/adb/yukizygisk"
 
-static int failure(const char *stage, int error) {
-  fprintf(stderr, "viola: %s: %s (%d)\n", stage, strerror(-error), error);
-  return error ? error : -EIO;
-}
-
-// 强行获取内核控制句柄（修复了 SYS_prctl 缺失）
 static int control_open(unsigned option, unsigned magic) {
   int fd = -ENODEV;
   syscall(SYS_prctl, option, magic, (unsigned long)&fd);
   return fd;
 }
 
-// 自己读取文件并调用真正的内核加载函数（修复了函数名错误）
 static int load_kernel_module(const char *directory) {
     char ko_path[PATH_MAX];
-    // 强行锁定你的 KMI 和模块名
     snprintf(ko_path, sizeof(ko_path), "%s/lkm/android15-6.6_yukizygisk.ko", directory);
     
     int fd = open(ko_path, O_RDONLY | O_CLOEXEC);
@@ -69,7 +61,6 @@ static int load_kernel_module(const char *directory) {
 
     mprotect(buffer, (size_t)st.st_size, PROT_READ);
     
-    // 调用原版正确的加载函数（image指针，size，参数，syscall函数）
     int ret = viola_load_verified_kernel(buffer, (size_t)st.st_size, 
                                          "ksu_module_present=1", 
                                          (long (*)(long, unsigned long, unsigned long, unsigned long))syscall);
@@ -120,21 +111,18 @@ int main(int argc, char **argv) {
       return 0;
   }
 
-  // 1. 强行加载 .ko 模块
   int ret = load_kernel_module(directory);
   if (ret) {
       fprintf(stderr, "viola: load kernel failed: %d\n", ret);
       return 1;
   }
 
-  // 2. 获取内核控制节点
   int control = control_open(YZ_PRCTL_CONTROL_OPTION, YZ_PRCTL_CONTROL_MAGIC);
   if (control < 0) {
       fprintf(stderr, "viola: control_open failed\n");
       return 1;
   }
 
-  // 3. 拉起 zygiskd 并传递控制句柄
   start_zygiskd(directory, control);
   
   printf("viola: launch succeeded\n");
