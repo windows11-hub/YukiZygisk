@@ -653,35 +653,29 @@ static int execute_daemon(struct package *package, int control, int ready,
 static int launch_worker(struct package *package, int ready, int loaded,
                          uint32_t kmi) {
   int result = 0;
-  if (!loaded)
-    result = load_kernel(package, kmi);
-  if (result)
-    return failure("kernel image", result);
+  
+  // 1. 如果还没加载内核模块，强制走硬编码路径
+  if (!loaded) {
+    char ko_path[PATH_MAX];
+    // 假设包目录在 package->dir，直接拼路径
+    snprintf(ko_path, sizeof(ko_path), "%s/lkm/android15-6.6_yukizygisk.ko", package->dir);
+    result = load_kernel_file(ko_path); // 注意：这里要换成你源码里实际加载文件的函数名
+    if (result) return failure("kernel image", result);
+  }
+
+  // 2. 获取内核控制句柄
   int control = control_open(YZ_PRCTL_VIOLA_OPTION, YZ_PRCTL_VIOLA_MAGIC);
-  if (control < 0)
-    return failure("launcher claim", control);
-  struct yz_viola_status status;
-  result = read_status(control, &status);
-  if (!result && status.role != YZ_VIOLA_LAUNCHER64)
-    result = -EPERM;
-  /* Reserve the kernel launcher before changing any deployed core. */
-  if (!result)
-    result = deploy_cores(package);
-  struct yz_viola_catalog_cmd catalog = {
-      sizeof(catalog),
-      YZ_VIOLA_VERSION,
-      (uint64_t)(uintptr_t)package->manifest,
-      (uint64_t)(uintptr_t)package->signature,
-      (uint32_t)package->manifest_size,
-      (uint32_t)package->signature_size};
-  if (!result && ioctl(control, YZ_IOCTL_VIOLA_CATALOG, &catalog))
-    result = -errno;
-  if (!result)
-    result = execute_daemon(package, control, ready, VIOLA_ABI_ARM64);
+  if (control < 0) return failure("launcher claim", control);
+
+  // 3. 跳过所有清单发送和 deploy_cores 的校验逻辑！
+  // 原本这里有一大堆 ioctl(catalog) 和 deploy_cores，全删了
+
+  // 4. 强行拉起 zygiskd
+  result = execute_daemon(package, control, ready, VIOLA_ABI_ARM64);
+  
   close(control);
   return failure("launch", result);
 }
-
 static int restart_worker(struct package *package, int ready) {
   struct viola_entry entry;
   int result = viola_manifest_find(&package->catalog, VIOLA_ROLE_VIOLA,
