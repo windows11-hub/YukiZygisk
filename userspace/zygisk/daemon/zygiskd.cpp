@@ -2792,13 +2792,7 @@ int run_daemon() {
     return 1;
   }
 
-  yz_runtime_query_cmd capabilities{};
-  if (yzhost::ctl(YZ_IOCTL_GET_RUNTIME, &capabilities) != 0 ||
-      !(capabilities.capabilities & YZ_RUNTIME_CAP_ENDPOINT_STATE)) {
-    DLOGE("kernel/userspace version mismatch: endpoint handoff is required");
-    notify_ready(ready_fd, false);
-    return 1;
-  }
+
   int srv = bind_listen();
   if (srv < 0) {
     const int bind_errno = errno;
