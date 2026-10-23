@@ -563,15 +563,6 @@ struct yz_auth_session *yz_auth_open(bool launcher)
 			if (original_loader_alive)
 				goto fail;
 		}
-		return true;
-		ret = yz_auth_check_current(VIOLA_ROLE_VIOLA);
-		if (ret)
-			goto fail;
-		if ((yz_auth_initial_claimed || task_tgid(current) != yz_auth_loader_pid ||
-		     current->mm != yz_auth_loader_mm) && !yz_auth_observed_exec()) {
-			ret = -EACCES;
-			goto fail;
-		}
 		role = YZ_VIOLA_LAUNCHER64;
 	}
 	s = yz_auth_alloc(current, role);
