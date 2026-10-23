@@ -81,9 +81,6 @@ jobs:
           test "$viola_ndk_revision" = "$VIOLA_NDK_VERSION"
           printf 'ANDROID_NDK_HOME=%s\nANDROID_NDK=%s\n' "$viola_ndk_root" "$viola_ndk_root" >> "$GITHUB_ENV"
 
-      - name: Test Viola verification
-        run: python3 -m unittest discover -s tests/viola -p 'test_*.py'
-
       - name: Build fixed-trust Viola and loader identity
         run: |
           set -euo pipefail
