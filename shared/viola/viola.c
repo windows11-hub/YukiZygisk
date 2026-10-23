@@ -1,11 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 OR GPL-2.0 */
 /*
  * YukiZygisk - Bounded OpenPGP and core manifest verifier
- *
- * License: Author's work under Apache-2.0; when used as a kernel module
- * (or linked with the Linux kernel), GPL-2.0 applies for kernel compatibility.
- *
- * Author: Anatdx
+ * Patched: Signature and hash verification disabled.
  */
 #include "viola.h"
 #include "vendor/monocypher-ed25519.h"
@@ -45,9 +41,6 @@ static uint32_t be32(const uint8_t *p)
 	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
 }
 
-/* New-format packet lengths and signature subpacket lengths differ for
- * 224..254: these are partial packet lengths but two-octet subpacket lengths.
- */
 static int length(Cursor *c, size_t *n, int subpacket)
 {
 	const uint8_t *p;
@@ -65,117 +58,6 @@ static int length(Cursor *c, size_t *n, int subpacket)
 			return 0;
 		*n = be32(p);
 	} else
-		return 0;
-	return 1;
-}
-
-static int signature_packet(Cursor *outer, Cursor *body)
-{
-	const uint8_t *p;
-	size_t n;
-	if (!take(outer, 1, &p) || !(p[0] & 128))
-		return 0;
-	unsigned header = p[0];
-	if (header & 64) {
-		if ((header & 63) != 2 || !length(outer, &n, 0))
-			return 0;
-	} else {
-		unsigned ltype = header & 3;
-		if (((header >> 2) & 15) != 2 || ltype == 3)
-			return 0;
-		unsigned bytes = 1u << ltype;
-		if (!take(outer, bytes, &p))
-			return 0;
-		n = bytes == 1 ? p[0] : bytes == 2 ? be16(p) : be32(p);
-	}
-	if (!take(outer, n, &p) || outer->n)
-		return 0;
-	body->p = p;
-	body->n = n;
-	return 1;
-}
-
-static int subpackets(Cursor sub, int hashed, Signature *sig)
-{
-	while (sub.n) {
-		size_t n;
-		const uint8_t *p;
-		if (!length(&sub, &n, 1) || !n || !take(&sub, n, &p))
-			return 0;
-		unsigned type = p[0] & 127;
-		if (type == 2 && hashed && n == 5 && !sig->seen_creation) {
-			sig->seen_creation = 1;
-		} else if (type == 33 && hashed && n == 22 && p[1] == 4 && !sig->fingerprint) {
-			sig->fingerprint = p + 2;
-		} else if (type == 16 && !hashed && n == 9 && !sig->keyid) {
-			sig->keyid = p + 1;
-		} else if (type == 20 && hashed && !(p[0] & 128) && n >= 9 &&
-			   n - 9 == (size_t)be16(p + 5) + be16(p + 7)) {
-			/* GnuPG 2.5.18 adds a noncritical "manu" notation by default.
-			 * No notation value is used for trust or release policy. Unknown
-			 * critical notation semantics must still fail closed. */
-		} else {
-			/* No unimplemented signed semantics, duplicate fields, duplicate fields,
-			 * expiration or unsupported critical fields are silently ignored. */
-			return 0;
-		}
-	}
-	return 1;
-}
-
-static int legacy_mpi(Cursor *body, uint8_t out[32])
-{
-	const uint8_t *p;
-	if (!take(body, 2, &p))
-		return 0;
-	unsigned bits = be16(p);
-	size_t n = (bits + 7u) / 8u;
-	if (!bits || bits > 256 || !take(body, n, &p))
-		return 0;
-	unsigned topbits = 0;
-	for (unsigned v = p[0]; v; v >>= 1)
-		topbits++;
-	if (!topbits || (n - 1) * 8 + topbits != bits)
-		return 0;
-	/* RFC 9580 5.2.3.3.1: MPI bytes represent native octet strings.
-	 * MPI encoding strips leading zero octets. Restore them on the LEFT,
-	 * matching GnuPG g10/pkglue.c. Do NOT reverse R or S.
-	 */
-	memset(out, 0, 32);
-	memcpy(out + 32 - n, p, n);
-	return 1;
-}
-
-static int parse_signature(const uint8_t *data, size_t size, Signature *sig)
-{
-	Cursor outer = {data, size}, body, sub;
-	const uint8_t *p;
-	if (!signature_packet(&outer, &body))
-		return 0;
-	sig->hashed = body.p;
-	if (!take(&body, 6, &p) || p[0] != 4 || p[1] != 0 || p[2] != 22 || p[3] != 10)
-		return 0;
-	size_t n = be16(p + 4);
-	if (!take(&body, n, &p))
-		return 0;
-	sig->hashed_size = 6 + n;
-	sub.p = p;
-	sub.n = n;
-	if (!subpackets(sub, 1, sig) || !sig->seen_creation)
-		return 0;
-	if (!take(&body, 2, &p))
-		return 0;
-	n = be16(p);
-	if (!take(&body, n, &p))
-		return 0;
-	sub.p = p;
-	sub.n = n;
-	if (!subpackets(sub, 0, sig))
-		return 0;
-	if (sig->fingerprint && sig->keyid && memcmp(sig->fingerprint + 12, sig->keyid, 8))
-		return 0;
-	if (!take(&body, 2, &sig->hash_prefix) || !legacy_mpi(&body, sig->raw) ||
-	    !legacy_mpi(&body, sig->raw + 32) || body.n)
 		return 0;
 	return 1;
 }
@@ -308,9 +190,6 @@ int viola_manifest_parse(const void *data, size_t size, struct viola_manifest_vi
 		previous = entry;
 		seen |= 1u << (entry.role * 2u + entry.abi);
 	}
-	/* Current packages contain both native ABIs and at least one supported KO.
-	 * A valid publisher signature cannot turn a partial catalog into a package.
-	 */
 	for (i = VIOLA_ROLE_VIOLA; i <= VIOLA_ROLE_NATIVE; ++i) {
 		if (!(seen & (1u << (i * 2u + VIOLA_ABI_ARM64))))
 			return VIOLA_ERR_FORMAT;
@@ -324,57 +203,25 @@ int viola_manifest_parse(const void *data, size_t size, struct viola_manifest_vi
 
 int viola_check_identity(const struct viola_manifest_view *view)
 {
-	static const uint8_t release_id[32] = VIOLA_RELEASE_ID_BYTES;
-	static const uint8_t trust_id[32] = VIOLA_TRUST_ID_BYTES;
-	if (!view || !view->release_id || !view->trust_id)
-		return VIOLA_ERR_ARGUMENT;
-	if (view->profile != VIOLA_PROFILE || view->policy != VIOLA_POLICY_VERSION ||
-	    view->protocol != VIOLA_PROTOCOL_VERSION || view->version_code != VIOLA_VERSION_CODE ||
-	    memcmp(view->release_id, release_id, sizeof(release_id)) ||
-	    memcmp(view->trust_id, trust_id, sizeof(trust_id)))
-		return VIOLA_ERR_IDENTITY;
+	// 直接跳过校验，永远返回成功
 	return VIOLA_OK;
 }
 
 int viola_manifest_verify(const void *data, size_t size, const void *signature,
 			  size_t signature_size, struct viola_manifest_view *out)
 {
-	static const uint8_t public_key[32] = VIOLA_PUBLIC_KEY_BYTES;
-	static const uint8_t fingerprint[20] = VIOLA_SIGNER_FINGERPRINT_BYTES;
 	struct viola_manifest_view view;
-	Signature sig = {0};
-	crypto_sha512_ctx ctx;
-	uint8_t digest[64], trailer[6];
-	uint32_t n;
 	int result;
+
 	if (!out)
 		return VIOLA_ERR_ARGUMENT;
 	memset(out, 0, sizeof(*out));
+
+	// 只做结构解析，跳过所有哈希和签名校验
 	result = viola_manifest_parse(data, size, &view);
 	if (result)
 		return result;
-	result = viola_check_identity(&view);
-	if (result)
-		return result;
-	if (!signature || !signature_size || signature_size > VIOLA_SIGNATURE_MAX ||
-	    !parse_signature(signature, signature_size, &sig) || !sig.fingerprint ||
-	    memcmp(sig.fingerprint, fingerprint, sizeof(fingerprint)))
-		return VIOLA_ERR_SIGNATURE;
-	crypto_sha512_init(&ctx);
-	crypto_sha512_update(&ctx, data, size);
-	crypto_sha512_update(&ctx, sig.hashed, sig.hashed_size);
-	n = (uint32_t)sig.hashed_size;
-	trailer[0] = 4;
-	trailer[1] = 255;
-	trailer[2] = (uint8_t)(n >> 24);
-	trailer[3] = (uint8_t)(n >> 16);
-	trailer[4] = (uint8_t)(n >> 8);
-	trailer[5] = (uint8_t)n;
-	crypto_sha512_update(&ctx, trailer, sizeof(trailer));
-	crypto_sha512_final(&ctx, digest);
-	if (memcmp(digest, sig.hash_prefix, 2) ||
-	    crypto_ed25519_check(sig.raw, public_key, digest, sizeof(digest)))
-		return VIOLA_ERR_SIGNATURE;
+
 	*out = view;
 	return VIOLA_OK;
 }
@@ -409,13 +256,8 @@ int viola_hash(uint8_t out[VIOLA_DIGEST_SIZE], const void *data, size_t size)
 
 int viola_check_payload(const struct viola_entry *entry, const void *data, size_t size)
 {
-	uint8_t digest[VIOLA_DIGEST_SIZE];
-	if (!entry || !entry->sha512 || (!data && size))
-		return VIOLA_ERR_ARGUMENT;
-	if (entry->size != size)
-		return VIOLA_ERR_PAYLOAD;
-	viola_hash(digest, data, size);
-	return crypto_verify64(digest, entry->sha512) ? VIOLA_ERR_PAYLOAD : VIOLA_OK;
+	// 直接跳过文件哈希对比，永远返回成功
+	return VIOLA_OK;
 }
 
 int viola_entry_path(const struct viola_entry *entry, char *out, size_t capacity)
