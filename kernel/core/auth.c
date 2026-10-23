@@ -287,6 +287,8 @@ long yz_auth_ioctl(struct yz_auth_session *s, unsigned int request, void __user 
 	struct yz_viola_status status;
 	struct yz_auth_session *main, *compat;
 	long ret = 0;
+	(void)main; 
+	(void)compat;
 
 	if (request == YZ_IOCTL_VIOLA_DAEMON_IDENTITY) {
 		if (!mutex_trylock(&yz_auth_lock)) return -EAGAIN;
