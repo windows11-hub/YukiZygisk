@@ -1,186 +1,68 @@
-# SPDX-License-Identifier: Apache-2.0
-#
-# YukiZygisk reusable DDK kernel-module build workflow.
-#
-# License: Apache-2.0
-#
-# Author: Anatdx
-
-name: Build YukiZygisk kernel module
+name: Build and Verify KPM Host
 
 on:
-  workflow_call:
-    inputs:
-      kmi:
-        description: GKI KMI target
-        required: true
-        type: string
-      ddk_release:
-        description: DDK container release
-        required: false
-        default: "20260828"
-        type: string
-      viola_context_artifact:
-        description: Public Viola context artifact from the caller's prepare job
-        required: false
-        default: ""
-        type: string
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
   workflow_dispatch:
-    inputs:
-      kmi:
-        description: GKI KMI target
-        required: true
-        default: android16-6.12
-        type: string
-      ddk_release:
-        description: DDK container release
-        required: false
-        default: "20260828"
-        type: string
-
-permissions:
-  contents: read
-
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-  VIOLA_NDK_VERSION: "29.0.14206865"
 
 jobs:
-  verify-native-stub:
-    name: Verify generated native injection images
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: recursive
-          persist-credentials: false
-      - uses: android-actions/setup-android@v4
-        with:
-          packages: ndk;30.0.16248370
-      - run: |
-          set -euo pipefail
-          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
-          python3 userspace/zygisk/inject/generate.py --ndk "$sdk_root/ndk/30.0.16248370"
-
-  prepare-viola:
-    name: Prepare standalone Viola build context
-    if: inputs.viola_context_artifact == ''
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          submodules: recursive
-          persist-credentials: false
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: tools/requirements-viola.txt
-
-      - name: Prepare public context and frozen loader identity
-        env:
-          DDK_RELEASE: ${{ inputs.ddk_release }}
-        run: |
-          set -euo pipefail
-          python3 -m pip install -r tools/requirements-viola.txt
-          viola_ndk_root="${ANDROID_HOME:?Android SDK is unavailable}/ndk/$VIOLA_NDK_VERSION"
-          if [ ! -f "$viola_ndk_root/source.properties" ]; then
-            sdkmanager --sdk_root="$ANDROID_HOME" --install "ndk;$VIOLA_NDK_VERSION"
-          fi
-          viola_ndk_revision="$(sed -n 's/^Pkg.Revision *= *//p' "$viola_ndk_root/source.properties" | tr -d '\r')"
-          test "$viola_ndk_revision" = "$VIOLA_NDK_VERSION"
-          export ANDROID_NDK_HOME="$viola_ndk_root" ANDROID_NDK="$viola_ndk_root"
-          printf 'ANDROID_NDK_HOME=%s\nANDROID_NDK=%s\n' "$viola_ndk_root" "$viola_ndk_root" >> "$GITHUB_ENV"
-          ./build.sh viola
-
-      - name: Upload standalone public build context
-        uses: actions/upload-artifact@v6
-        with:
-          name: yukizygisk-viola-context-${{ inputs.kmi }}
-          path: |
-            build/viola/context.json
-            build/viola/publisher.pgp
-            build/viola/viola_build.h
-            build/viola/viola_loader.h
-          if-no-files-found: error
-
-      - name: Upload corresponding Viola executable
-        uses: actions/upload-artifact@v6
-        with:
-          name: yukizygisk-viola-${{ inputs.kmi }}
-          path: build/out/viola
-          if-no-files-found: error
-
-  build-lkm:
-    name: Build ${{ inputs.kmi }}_yukizygisk.ko
-    needs: [prepare-viola, verify-native-stub]
-    if: >-
-      !cancelled() &&
-      needs.verify-native-stub.result == 'success' &&
-      (needs.prepare-viola.result == 'success' ||
-       (needs.prepare-viola.result == 'skipped' && inputs.viola_context_artifact != ''))
+  build:
     runs-on: ubuntu-latest
     container:
-      image: ghcr.io/ylarod/ddk:${{ inputs.kmi }}-${{ inputs.ddk_release }}
+      image: ghcr.io/ylarod/ddk:android15-6.6-20260828
       options: --privileged
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          persist-credentials: false
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
-      - name: Download public Viola build context
-        uses: actions/download-artifact@v7
-        with:
-          name: ${{ inputs.viola_context_artifact || format('yukizygisk-viola-context-{0}', inputs.kmi) }}
-          path: build/viola
-
-      - name: Build kernel module
-        env:
-          KMI: ${{ inputs.kmi }}
+      - name: Build and Verify
+        shell: bash
         run: |
-          set -euo pipefail
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          if [ -z "${KDIR:-}" ] || [ ! -f "$KDIR/Makefile" ]; then
-            echo "KDIR is unavailable in the DDK container: ${KDIR:-<empty>}"
+          set -e
+          echo "=> KDIR: $KDIR"
+          
+          # 移除 6.6 内核下不支持的函数调用
+          sed -i '/resolve_cfi_shadow();/d' src/kpm_host_core.c
+          
+          echo "=> Compiling module..."
+          make -C "$KDIR" \
+            M="$PWD/src" \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CC=clang \
+            KCFLAGS="-ffixed-x18 -Wno-format" \
+            modules
+            
+          echo "=> Handling output..."
+          mkdir -p build
+          if [ -f "src/kpm_host.ko" ]; then
+            mv src/kpm_host.ko build/kpm_host-gki-6.6.ko
+            echo "=> Moved to build/kpm_host-gki-6.6.ko"
+          else
+            echo "=> ERROR: kpm_host.ko not found in src/"
             exit 1
           fi
-          test -s build/viola/viola_build.h
-          test -s build/viola/viola_loader.h
-          case "$KMI" in
-            android12-5.10) kmi_id=1 ;;
-            android13-5.10) kmi_id=2 ;;
-            android13-5.15) kmi_id=3 ;;
-            android14-5.15) kmi_id=4 ;;
-            android14-6.1) kmi_id=5 ;;
-            android15-6.6) kmi_id=6 ;;
-            android16-6.12) kmi_id=7 ;;
-            android17-6.18) kmi_id=8 ;;
-            *) echo "Unsupported KMI: $KMI"; exit 1 ;;
-          esac
+          
+          echo ""
+          echo "=================================================="
+          echo "                 LKM VERIFICATION"
+          echo "=================================================="
+          echo "Vermagic:"
+          modinfo -F vermagic build/kpm_host-gki-6.6.ko
+          echo ""
+          echo "Sections (.modinfo and .versions):"
+          readelf -S build/kpm_host-gki-6.6.ko | grep -E "\.modinfo|\.versions" || true
+          echo ""
+          echo "SHA256:"
+          sha256sum build/kpm_host-gki-6.6.ko
+          echo "=================================================="
 
-          make_args=(-C kernel -j"$(nproc --all)" KDIR="$KDIR" CC=clang VIOLA_KMI_ID="$kmi_id")
-          case "$KMI" in
-            android15-6.6|android16-6.12|android17-6.18) make_args+=(W=1) ;;
-          esac
-          make "${make_args[@]}"
-
-          mkdir -p build/out/lkm
-          output="build/out/lkm/${KMI}_yukizygisk.ko"
-          cp kernel/yukizygisk.ko "$output"
-          llvm-strip -d "$output"
-          test -s "$output"
-          ls -lh "$output"
-
-      - name: Upload kernel module
-        uses: actions/upload-artifact@v6
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: yukizygisk-lkm-${{ inputs.kmi }}
-          path: build/out/lkm/${{ inputs.kmi }}_yukizygisk.ko
+          name: kpm_host-gki-6.6
+          path: build/kpm_host-gki-6.6.ko
           if-no-files-found: error
