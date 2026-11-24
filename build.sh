@@ -35,6 +35,7 @@ STRIP_ANDROID=true
 VERBOSE=false
 ALL_KMIS=false
 SKIP_VIOLA=false
+SKIP_SIGN=false
 VIOLA_CONTEXT="$BUILD_DIR/viola"
 VIOLA_PYTHON="${VIOLA_PYTHON:-python3}"
 VIOLA_PROFILE="${VIOLA_PROFILE:-official}"
@@ -66,6 +67,7 @@ Options:
       --android-platform API Android platform (default: android-31)
       --ndk PATH             Android NDK path
       --skip-viola           Reuse this build context's stripped Viola
+      --skip-sign            Build the module package unsigned
       --skip-kernel          Reuse KMI-tagged modules in build/out/lkm
       --skip-daemon          Reuse build/out/zygiskd64 and zygiskd32
       --skip-ctl             Reuse build/out/yzctl
@@ -104,6 +106,10 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--skip-viola)
 		SKIP_VIOLA=true
+		shift
+		;;
+	--skip-sign)
+		SKIP_SIGN=true
 		shift
 		;;
 	--viola-profile)
@@ -633,10 +639,14 @@ package_module() {
 	find "$PACKAGE_DIR/webroot" -type f -exec chmod 0644 {} +
 
 	build_host_verifier
-	local sign_args=(sign --context "$VIOLA_CONTEXT" --module-dir "$PACKAGE_DIR"
-		--verifier "$OUT_DIR/viola-host")
-	[[ -z "${VIOLA_GPG:-}" ]] || sign_args+=(--gpg "$VIOLA_GPG")
-	"$VIOLA_PYTHON" "$PROJECT_ROOT/tools/viola.py" "${sign_args[@]}"
+	if [[ "${SKIP_SIGN:-false}" == true ]]; then
+		info "SKIP_SIGN=true: module package will NOT be signed"
+	else
+		local sign_args=(sign --context "$VIOLA_CONTEXT" --module-dir "$PACKAGE_DIR"
+			--verifier "$OUT_DIR/viola-host")
+		[[ -z "${VIOLA_GPG:-}" ]] || sign_args+=(--gpg "$VIOLA_GPG")
+		"$VIOLA_PYTHON" "$PROJECT_ROOT/tools/viola.py" "${sign_args[@]}"
+	fi
 	"$VIOLA_PYTHON" "$PROJECT_ROOT/tools/module_checksums.py" "$PACKAGE_DIR"
 
 	local package_target="$KMI"
