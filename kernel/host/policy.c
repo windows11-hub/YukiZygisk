@@ -100,20 +100,23 @@ int yz_fixed_policy_latch(void)
 		ret = yz_fixed_read_config();
 		yz_fixed_status.error = ret;
 		/*
-		 * An absent policy file is not a failure to latch: it is the
-		 * ordinary "this build was never given a fixed policy" case, and
-		 * it used to latch nothing at all. read_config() then returns
-		 * -ENOENT, initialized stayed 0, yz_fixed_policy_ready() was
-		 * false forever, and every caller that gates on it - policy-boot
-		 * first - failed with -EACCES ("Operation not permitted").
+		 * A missing policy file is not a failure to latch. It is the
+		 * ordinary case of a build that was never handed a fixed policy,
+		 * and it used to latch nothing: read_config() returns -ENOENT,
+		 * the branch below was skipped, initialized stayed 0 and
+		 * yz_fixed_policy_ready() answered false forever. Every caller
+		 * gated on ready() - yzctl policy-boot first - then failed with
+		 * -EACCES, surfaced to the user as "Operation not permitted".
 		 *
-		 * Treat only ENOENT as "no policy requested". Every other error
-		 * still refuses to latch, because a file that exists but is
-		 * malformed is a real problem that must not be papered over as
-		 * "policy disabled".
+		 * Only ENOENT is treated as "no policy requested". Any other
+		 * error still refuses to latch: a file that exists but is
+		 * malformed, wrongly owned or the wrong size is a real fault,
+		 * and reporting it as "policy disabled" would hide exactly the
+		 * misconfiguration the checks in read_config() exist to catch.
 		 */
 		if (!ret || ret == -ENOENT) {
-			yz_fixed_status.requested = ret ? 0 : yz_fixed_config.enabled;
+			yz_fixed_status.requested =
+				ret ? 0 : yz_fixed_config.enabled;
 			if (!yz_fixed_status.requested)
 				smp_store_release(&yz_fixed_status.initialized, 1);
 			yz_fixed_latched = true;
