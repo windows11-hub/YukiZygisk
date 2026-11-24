@@ -6,6 +6,17 @@
  * (or linked with the Linux kernel), GPL-2.0 applies for kernel compatibility.
  *
  * Author: Rouyashiki Developers
+ *
+ * CHANGE: safe mode no longer suppresses injection.
+ *
+ * The guard still counts zygote restarts and still reports them through the
+ * status/variants/runtime queries, so the number stays observable. What is
+ * gone is the effect: this function never returns true, so a zygote start is
+ * never skipped and injection is attempted every time.
+ *
+ * Trade-off, stated plainly: the guard existed to stop a broken injection from
+ * turning into an endless zygote crash loop. With it inert, that loop is no
+ * longer broken automatically - a bad injection now needs a manual restart.
  */
 
 #include <linux/compiler.h>
@@ -61,7 +72,6 @@ bool yz_safemode_should_skip(const char *name)
 	pid_t pid = current->tgid;
 	u32 crashes = 0;
 	bool activate = false;
-	bool skip = false;
 	int free_slot;
 	int slot;
 
@@ -76,13 +86,17 @@ bool yz_safemode_should_skip(const char *name)
 			     sizeof(yz_zygote_guards[slot].name), zygote);
 	}
 	if (yz_safemode_active) {
+		/* INFO: Already latched. Keep the pid fresh so the variants query
+		 * reports where zygote is now; nothing else to do here. */
 		if (slot >= 0)
 			yz_zygote_guards[slot].last_pid = pid;
-		skip = true;
 		crashes = yz_safemode_zygote_crashes;
 	} else if (slot >= 0) {
 		struct yz_zygote_guard *guard = &yz_zygote_guards[slot];
 
+		/* INFO: last_pid == 0 is the first sighting of this slot, not a
+		 * restart. A different pid on a known slot is zygote coming back,
+		 * which is what the counter is for. */
 		if (guard->last_pid == 0) {
 			guard->last_pid = pid;
 		} else if (guard->last_pid != pid) {
@@ -96,24 +110,20 @@ bool yz_safemode_should_skip(const char *name)
 					     sizeof(yz_safemode_zygote),
 					     zygote);
 				activate = true;
-				skip = true;
 			}
 		}
 	}
 	spin_unlock_irqrestore(&yz_safemode_lock, flags);
 
 	if (activate) {
-		pr_warn("yukizygisk: safemode: safemode enabled after %u %s "
-			"restart(s); skip pid=%d\n",
-			crashes, zygote, pid);
+		pr_warn("yukizygisk: safemode: %u %s restart(s); latch set, "
+			"injection still runs (safe mode inert)\n",
+			crashes, zygote);
 		yz_events_emit_safemode((u32)pid, crashes);
-	} else if (skip) {
-		pr_info(
-		    "yukizygisk: safemode: safemode active, skip zygote pid=%d "
-		    "name=%s crashes=%u\n",
-		    pid, zygote, crashes);
 	}
-	return skip;
+
+	/* INFO: Always false - the whole point of this variant. */
+	return false;
 }
 
 int yz_safemode_get_status(struct yz_safemode_status_cmd *cmd)
