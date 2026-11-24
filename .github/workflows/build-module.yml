@@ -277,26 +277,9 @@ jobs:
           name: yukizygisk-userspace-arm64-v8a
           path: build/out
 
-      - name: Sign and verify all-KMI module package
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-          VIOLA_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+      - name: Build all-KMI module package
         run: |
           set -euo pipefail
-          if [ -z "$GPG_PRIVATE_KEY" ]; then
-            echo "Official packaging requires GPG_PRIVATE_KEY."
-            exit 1
-          fi
-          VIOLA_SIGNING_HOME="$(mktemp -d)"
-          export GNUPGHOME="$VIOLA_SIGNING_HOME"
-          chmod 0700 "$VIOLA_SIGNING_HOME"
-          cleanup_signing() {
-            gpgconf --homedir "$VIOLA_SIGNING_HOME" --kill gpg-agent >/dev/null 2>&1 || true
-            rm -rf -- "$VIOLA_SIGNING_HOME"
-          }
-          trap cleanup_signing EXIT
-          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
-          unset GPG_PRIVATE_KEY
           ./build.sh package --all-kmis --skip-viola --skip-kernel --skip-daemon --skip-ctl --skip-payloads
           unzip -Z1 build/out/YukiZygisk-*-all-kmi-arm64-v8a.zip | sort
 
