@@ -280,7 +280,7 @@ jobs:
       - name: Build all-KMI module package
         run: |
           set -euo pipefail
-          ./build.sh package --all-kmis --skip-viola --skip-kernel --skip-daemon --skip-ctl --skip-payloads
+          ./build.sh package --all-kmis --skip-viola --skip-kernel --skip-daemon --skip-ctl --skip-payloads --skip-sign
           unzip -Z1 build/out/YukiZygisk-*-all-kmi-arm64-v8a.zip | sort
 
       - name: Upload module package
